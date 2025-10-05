@@ -13,6 +13,7 @@ import json
 import matplotlib.pyplot as plt
 import pdb
 from functools import reduce
+from functorch import make_functional, grad, vmap
 sys.path.insert(1, "../../")
 import utils
 
@@ -55,6 +56,13 @@ class GA_PINN(nn.Module):
 		## Now, register the parameters as trainable variables
 		self.params_hidden = nn.ModuleList(self.dense_layers)
 		
+		# [新增] 将模型转换为 functional 形式，以便于计算 Jacobian
+		self.func_model, self.func_params = make_functional(self)
+
+		# [新增] 用于缓存 NTK 权重的属性
+		self.ntk_weights = None
+		self.ntk_update_freq = self.config["training_process"]["parameters"].get("ntk_update_freq", 100) # 定义更新频率，这是一个新的超参数！
+		
 		# Related with the L2 computation.
 		self.l2_hist, self.l2_rho_hist, self.l2_ux_hist, self.l2_p_hist = [], [], [], []
 		# Define lists for the physical losses.
@@ -65,19 +73,25 @@ class GA_PINN(nn.Module):
 		self.act_ux = eval(self.config["neural"]["activation_functions"]["output"][1])
 		self.act_p = eval(self.config["neural"]["activation_functions"]["output"][2])
 		self.act_hidden = eval(self.config["neural"]["activation_functions"]["hidden_layers"])
-	def compute_l2(self):
-		with torch.no_grad():
-			prediction = self(self.analytical_space)
-		rho_pred, ux_pred, p_pred = prediction[:,0:1], prediction[:,1:2], prediction[:,2:3]
-		rho_truth, ux_truth, p_truth = self.analytical_solution[:,0:1], self.analytical_solution[:,1:2], self.analytical_solution[:,2:3]
+
+	# 计算 NTK 迹的辅助函数
+	def compute_ntk_trace(self, x):
+		def model_output(params, x_single):
+			# forward pass 够了
+			return self.func_model(params, x_single.unsqueeze(0)).squeeze(0)
+
+		# 计算单个 Jacobian
+		jac1 = vmap(grad(lambda params, x: model_output(params, x)[0]))(self.func_params, x)
+		jac2 = vmap(grad(lambda params, x: model_output(params, x)[1]))(self.func_params, x)
+		jac3 = vmap(grad(lambda params, x: model_output(params, x)[2]))(self.func_params, x)
 		
-		l2_rho = torch.sqrt(torch.square(rho_truth - rho_pred).sum()/torch.square(rho_truth).sum()).item()
-		l2_ux = torch.sqrt(torch.square(ux_truth - ux_pred).sum()/torch.square(ux_truth).sum()).item()
-		l2_p = torch.sqrt(torch.square(p_truth - p_pred).sum()/torch.square(p_truth).sum()).item()
-		self.l2_rho_hist.append(l2_rho)
-		self.l2_ux_hist.append(l2_ux)
-		self.l2_p_hist.append(l2_p)
-		self.l2_hist.append(l2_rho + l2_ux + l2_p)
+		# 计算每个输出的 NTK 迹，取平均
+		trace1 = sum(j.pow(2).sum() for j in jac1) / len(x)
+		trace2 = sum(j.pow(2).sum() for j in jac2) / len(x)
+		trace3 = sum(j.pow(2).sum() for j in jac3) / len(x)
+
+		return trace1, trace2, trace3
+
 	def forward(self, X):
 		# Training bucle.
 		for i in range( len(self.dense_layers) - 1 ):
@@ -89,6 +103,7 @@ class GA_PINN(nn.Module):
 		ux = self.act_ux(X[:,1:2])
 		p = self.act_p(X[:,2:3])
 		return torch.cat((rho, ux, p), dim = 1)
+		
 	def compute_loss(self, X, X_0, U_0):
 		t, x = X[:,0:1], X[:,1:2]
 		prediction = self(torch.cat((t, x), dim = 1 ))
@@ -132,72 +147,85 @@ class GA_PINN(nn.Module):
 		L_t_3 = torch.square(E_t + F3_x).view(self.N_t, self.N_x, 1)
 		
 		## Total physical loss
-		L_t = torch.mean( Lambda * (L_t_1 + L_t_2 + L_t_3), dim = 1 )
+		L_phys_tensor = torch.mean( Lambda * (L_t_1 + L_t_2 + L_t_3), dim = 1 )
 		# ================================================================================================================================
 		
-		## Compute loss for tmin (L_IC).
+		# 计算原始损失项 (无权重) 
 		prediction_tmin = self(X_0)
-		# Consider a certain weight for the IC (hyperparameter) and for the collocation loss.
-		w_rho, w_ux, w_p = self.config["neural"]["loss_function_parameters"]["w_IC"]
-		w_R = self.config["neural"]["loss_function_parameters"]["w_R"]
-		# Compute initial losses.
-		L_IC_rho = w_rho * torch.square(U_0[:,0:1] - prediction_tmin[:,0:1]).mean()
-		L_IC_ux = w_ux * torch.square(U_0[:,1:2] - prediction_tmin[:,1:2]).mean()
-		L_IC_p = w_p * torch.square(U_0[:,2:3] - prediction_tmin[:,2:3]).mean()
-		L_IC = L_IC_rho + L_IC_ux + L_IC_p
-		L_t = torch.cat( (L_IC.view(1,1), L_t[1:]), dim = 0 )
+		
+		# 计算原始的 IC 损失
+		L_IC_rho_raw = torch.square(U_0[:,0:1] - prediction_tmin[:,0:1]).mean()
+		L_IC_ux_raw = torch.square(U_0[:,1:2] - prediction_tmin[:,1:2]).mean()
+		L_IC_p_raw = torch.square(U_0[:,2:3] - prediction_tmin[:,2:3]).mean()
+		
+		# 计算原始的物理损失
+		L_phys_raw = L_phys_tensor.mean()
+		
+		# 带缓存的 NTK 权重计算
+		if self.epoch % self.ntk_update_freq == 0 or self.ntk_weights is None:
+			with torch.no_grad():
+				# 计算初始点 (X_0) 上每个输出的 NTK 迹
+				ntk_trace_rho_ic, ntk_trace_ux_ic, ntk_trace_p_ic = self.compute_ntk_trace(X_0)
+				
+				# 计算内部点 (X) 上每个输出的 NTK 迹
+				# 对于物理损失，取其涉及的所有变量 NTK 迹的平均值
+				ntk_traces_phys = self.compute_ntk_trace(X.view(-1, 2))
+				ntk_trace_phys_avg = sum(ntk_traces_phys) / len(ntk_traces_phys)
+
+				# 计算所有迹的平均值，作为平衡的基准
+				all_traces = [ntk_trace_rho_ic, ntk_trace_ux_ic, ntk_trace_p_ic, ntk_trace_phys_avg]
+				avg_trace = sum(all_traces) / len(all_traces)
+
+				# 计算权重：权重与 NTK 迹成反比
+				lambda_ic_rho = avg_trace / ntk_trace_rho_ic
+				lambda_ic_ux = avg_trace / ntk_trace_ux_ic
+				lambda_ic_p = avg_trace / ntk_trace_p_ic
+				lambda_phys = avg_trace / ntk_trace_phys_avg
+
+				# 将计算出的权重缓存起来
+				self.ntk_weights = {
+					"lambda_ic_rho": lambda_ic_rho,
+					"lambda_ic_ux": lambda_ic_ux,
+					"lambda_ic_p": lambda_ic_p,
+					"lambda_phys": lambda_phys
+				}
+		
+		# 从缓存中获取权重
+		weights = self.ntk_weights
+		
+		# 使用动态权重计算总损失
+		w_R_final = self.config["neural"]["loss_function_parameters"]["w_R"]
+		annealing_epochs = self.config["neural"]["loss_function_parameters"]["annealing_epochs"]
+		w_R = w_R_final * min(1.0, self.epoch / annealing_epochs)
+
+		# 加权各项损失
+		L_IC = (weights["lambda_ic_rho"] * L_IC_rho_raw + 
+				weights["lambda_ic_ux"] * L_IC_ux_raw + 
+				weights["lambda_ic_p"] * L_IC_p_raw)
+				
+		total_loss = L_IC + w_R * weights["lambda_phys"] * L_phys_raw
+
 		### Take advantage and save initial losses into lists
 		self.loss_ic_hist.append(L_IC.item())
-		self.loss_ic_rho.append(torch.square(U_0[:,0:1] - prediction_tmin[:,0:1]).mean().item())
-		self.loss_ic_ux.append(torch.square(U_0[:,1:2] - prediction_tmin[:,1:2]).mean().item())
-		self.loss_ic_p.append(torch.square(U_0[:,2:3] - prediction_tmin[:,2:3]).mean().item())
+		self.loss_ic_rho.append(L_IC_rho_raw.item()) # 保存原始损失，方便Test
+		self.loss_ic_ux.append(L_IC_ux_raw.item()) 
+		self.loss_ic_p.append(L_IC_p_raw.item()) 
+		
 		## Compute and save l2 errors
 		self.compute_l2()
-		return L_t.mean()
+		
+		return total_loss
 	def train_step(self, X, X_0, U_0, optimizer):
 		optimizer.zero_grad(set_to_none = True)
 		# Compute the loss
 		loss = self.compute_loss(X, X_0, U_0)
 		loss.backward(retain_graph = False)
-		# Apply gradient clipping and update parameters
-		#torch.nn.utils.clip_grad_value_(self.parameters(), 1.0)
-		#torch.nn.utils.clip_grad_norm_(self.parameters(), 1.0)
+		
+		# 启用梯度裁剪
+		clip_value = self.config["training_process"]["parameters"].get("gradient_clip_value", 1.0)
+		torch.nn.utils.clip_grad_norm_(self.parameters(), clip_value)
+		
 		optimizer.step()
 		# Save data
 		self.loss_hist.append(loss.item())
 		return loss
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

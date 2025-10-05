@@ -29,14 +29,15 @@
             "w_R": 1.0,
             "w_IC": [1e4, 1e4, 1e4],
             "alpha_set": [1.0, 1.0, 1.0],
-            "beta_set": [1.25, 1.25, 1.25]
+            "beta_set": [1.25, 1.25, 1.25],
+            "annealing_epochs": 5000
         }
     },
     "training_process": {
-        "device": "cuda",
+        "device": "cpu",
         "DTYPE": "torch.float32",
         "import":{
-            "analytical_solution_path": "../Ground_Data/Problem_1/Analytical_Solution_Test_1.h5"
+            "analytical_solution_path": "Ground_Data/Problem_1/Analytical_Solution_Test_1.h5"
         },
         "export":{
             "path_images": "Images/",
@@ -45,11 +46,20 @@
             "save_each_images": 5000,
             "save_each_data": 20000
         },
+        "checkpoint": {
+            "path": "Checkpoints/",
+            "save_each_checkpoint": 10000,
+            "resume_from_checkpoint": false
+        },
         "parameters": {
             "optimizer": "Adam",
-            "learning_rate": 1e-5,
+            "learning_rate": 5e-4,
+            "lr_decay_gamma": 0.99,
             "epochs": 600001,
-            "random_seed": 123456
+            "random_seed": 123456,
+            "gradient_clip_value": 1.0,
+            "lr_scheduler_step_size": 1000,
+            "ntk_update_freq": 100
         }
     }
 }
