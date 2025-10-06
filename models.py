@@ -133,18 +133,28 @@ class GA_PINN(nn.Module):
 		grad_fn_ux = grad(lambda params, x_sample: model_output(params, x_sample)[1])
 		grad_fn_p = grad(lambda params, x_sample: model_output(params, x_sample)[2])
 
-		# 使用 vmap 进行批处理计算雅可比矩阵
-		# in_dims=(None, 0) 的含义是：
-		# - 对第一个输入 (模型参数 self.func_params)，不进行批处理 (None)
-		# - 对第二个输入 (数据 x)，沿着其第 0 维 (批处理维度) 进行批处理 (0)
-		jac1 = vmap(grad_fn_rho, in_dims=(None, 0))(self.func_params, x)
-		jac2 = vmap(grad_fn_ux, in_dims=(None, 0))(self.func_params, x)
-		jac3 = vmap(grad_fn_p, in_dims=(None, 0))(self.func_params, x)
+		# 初始化用于累加迹的变量
+		sum_trace1, sum_trace2, sum_trace3 = 0.0, 0.0, 0.0
 		
-		# 计算并返回每个输出对应的 NTK 的迹的平均值
-		trace1 = sum(j.pow(2).sum() for j in jac1) / len(x)
-		trace2 = sum(j.pow(2).sum() for j in jac2) / len(x)
-		trace3 = sum(j.pow(2).sum() for j in jac3) / len(x)
+		# 定义块大小，这是一个可以根据显存调整的超参数
+		chunk_size = 1024 
+		
+		# 使用 torch.split 对输入 x 进行分块，并迭代处理每个块
+		for x_chunk in torch.split(x, chunk_size):
+			# 对当前块使用 vmap 进行批处理计算雅可比矩阵
+			jac1_chunk = vmap(grad_fn_rho, in_dims=(None, 0))(self.func_params, x_chunk)
+			jac2_chunk = vmap(grad_fn_ux, in_dims=(None, 0))(self.func_params, x_chunk)
+			jac3_chunk = vmap(grad_fn_p, in_dims=(None, 0))(self.func_params, x_chunk)
+			
+			# 计算当前块的迹的平方和，并累加
+			sum_trace1 += sum(j.pow(2).sum() for j in jac1_chunk)
+			sum_trace2 += sum(j.pow(2).sum() for j in jac2_chunk)
+			sum_trace3 += sum(j.pow(2).sum() for j in jac3_chunk)
+
+		# 在所有块处理完毕后，计算总的平均迹
+		trace1 = sum_trace1 / len(x)
+		trace2 = sum_trace2 / len(x)
+		trace3 = sum_trace3 / len(x)
 
 		return trace1, trace2, trace3
 
