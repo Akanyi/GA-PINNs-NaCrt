@@ -31,6 +31,11 @@
             "alpha_set": [1.0, 1.0, 1.0],
             "beta_set": [1.25, 1.25, 1.25],
             "annealing_epochs": 5000
+        },
+        "fourier_features": {
+            "use_fourier_features": true,
+            "mapping_size": 256,
+            "scale": 10.0
         }
     },
     "training_process": {
