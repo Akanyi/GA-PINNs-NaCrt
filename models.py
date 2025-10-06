@@ -133,18 +133,28 @@ class GA_PINN(nn.Module):
 		grad_fn_ux = grad(lambda params, x_sample: model_output(params, x_sample)[1])
 		grad_fn_p = grad(lambda params, x_sample: model_output(params, x_sample)[2])
 
-		# 使用 vmap 进行批处理计算雅可比矩阵
-		# in_dims=(None, 0) 的含义是：
-		# - 对第一个输入 (模型参数 self.func_params)，不进行批处理 (None)
-		# - 对第二个输入 (数据 x)，沿着其第 0 维 (批处理维度) 进行批处理 (0)
-		jac1 = vmap(grad_fn_rho, in_dims=(None, 0))(self.func_params, x)
-		jac2 = vmap(grad_fn_ux, in_dims=(None, 0))(self.func_params, x)
-		jac3 = vmap(grad_fn_p, in_dims=(None, 0))(self.func_params, x)
+		# 初始化用于累加迹的变量
+		sum_trace1, sum_trace2, sum_trace3 = 0.0, 0.0, 0.0
 		
-		# 计算并返回每个输出对应的 NTK 的迹的平均值
-		trace1 = sum(j.pow(2).sum() for j in jac1) / len(x)
-		trace2 = sum(j.pow(2).sum() for j in jac2) / len(x)
-		trace3 = sum(j.pow(2).sum() for j in jac3) / len(x)
+		# 定义块大小，这是一个可以根据显存调整的超参数
+		chunk_size = 4096
+		
+		# 使用 torch.split 对输入 x 进行分块，并迭代处理每个块
+		for x_chunk in torch.split(x, chunk_size):
+			# 对当前块使用 vmap 进行批处理计算雅可比矩阵
+			jac1_chunk = vmap(grad_fn_rho, in_dims=(None, 0))(self.func_params, x_chunk)
+			jac2_chunk = vmap(grad_fn_ux, in_dims=(None, 0))(self.func_params, x_chunk)
+			jac3_chunk = vmap(grad_fn_p, in_dims=(None, 0))(self.func_params, x_chunk)
+			
+			# 计算当前块的迹的平方和，并累加
+			sum_trace1 += sum(j.pow(2).sum() for j in jac1_chunk)
+			sum_trace2 += sum(j.pow(2).sum() for j in jac2_chunk)
+			sum_trace3 += sum(j.pow(2).sum() for j in jac3_chunk)
+
+		# 在所有块处理完毕后，计算总的平均迹
+		trace1 = sum_trace1 / len(x)
+		trace2 = sum_trace2 / len(x)
+		trace3 = sum_trace3 / len(x)
 
 		return trace1, trace2, trace3
 
@@ -213,30 +223,36 @@ class GA_PINN(nn.Module):
 		L_IC_ux_raw = torch.square(U_0[:,1:2] - prediction_tmin[:,1:2]).mean()
 		L_IC_p_raw = torch.square(U_0[:,2:3] - prediction_tmin[:,2:3]).mean()
 		
-		# 基于 NTK 动态计算各项损失的权重
-		if self.epoch % self.ntk_update_freq == 0 or self.ntk_weights is None:
-			with torch.no_grad():
-				ntk_trace_rho_ic, ntk_trace_ux_ic, ntk_trace_p_ic = self.compute_ntk_trace(X_0)
-				ntk_traces_phys = self.compute_ntk_trace(X.view(-1, 2))
-				ntk_trace_phys_avg = sum(ntk_traces_phys) / len(ntk_traces_phys)
+		# --- 停用 NTK 权重 ---
+		# # 基于 NTK 动态计算各项损失的权重
+		# if self.epoch % self.ntk_update_freq == 0 or self.ntk_weights is None:
+		# 	with torch.no_grad():
+		# 		ntk_trace_rho_ic, ntk_trace_ux_ic, ntk_trace_p_ic = self.compute_ntk_trace(X_0)
+		# 		ntk_traces_phys = self.compute_ntk_trace(X.view(-1, 2))
+		# 		ntk_trace_phys_avg = sum(ntk_traces_phys) / len(ntk_traces_phys)
 
-				all_traces = [ntk_trace_rho_ic, ntk_trace_ux_ic, ntk_trace_p_ic, ntk_trace_phys_avg]
-				avg_trace = sum(all_traces) / len(all_traces)
+		# 		all_traces = [ntk_trace_rho_ic, ntk_trace_ux_ic, ntk_trace_p_ic, ntk_trace_phys_avg]
+		# 		avg_trace = sum(all_traces) / len(all_traces)
 
-				# 权重与 NTK 的迹成反比，以平衡不同损失项的学习速率
-				lambda_ic_rho = avg_trace / ntk_trace_rho_ic
-				lambda_ic_ux = avg_trace / ntk_trace_ux_ic
-				lambda_ic_p = avg_trace / ntk_trace_p_ic
-				lambda_phys = avg_trace / ntk_trace_phys_avg
+		# 		# 权重与 NTK 的迹成反比，以平衡不同损失项的学习速率
+		# 		lambda_ic_rho = avg_trace / ntk_trace_rho_ic
+		# 		lambda_ic_ux = avg_trace / ntk_trace_ux_ic
+		# 		lambda_ic_p = avg_trace / ntk_trace_p_ic
+		# 		lambda_phys = avg_trace / ntk_trace_phys_avg
 
-				self.ntk_weights = {
-					"lambda_ic_rho": lambda_ic_rho,
-					"lambda_ic_ux": lambda_ic_ux,
-					"lambda_ic_p": lambda_ic_p,
-					"lambda_phys": lambda_phys
-				}
+		# 		self.ntk_weights = {
+		# 			"lambda_ic_rho": lambda_ic_rho,
+		# 			"lambda_ic_ux": lambda_ic_ux,
+		# 			"lambda_ic_p": lambda_ic_p,
+		# 			"lambda_phys": lambda_phys
+		# 		}
 		
-		weights = self.ntk_weights
+		# weights = self.ntk_weights
+
+		# 使用简单的静态权重
+		w_IC_rho = 100.0 
+		w_IC_ux = 100.0
+		w_IC_p = 100.0
 		
 		# 对物理损失的权重进行退火处理
 		w_R_final = self.config["neural"]["loss_function_parameters"]["w_R"]
@@ -244,11 +260,11 @@ class GA_PINN(nn.Module):
 		w_R = w_R_final * min(1.0, self.epoch / annealing_epochs)
 
 		# 计算加权后的总损失
-		L_IC = (weights["lambda_ic_rho"] * L_IC_rho_raw + 
-				weights["lambda_ic_ux"] * L_IC_ux_raw + 
-				weights["lambda_ic_p"] * L_IC_p_raw)
+		L_IC = (w_IC_rho * L_IC_rho_raw + 
+				w_IC_ux * L_IC_ux_raw + 
+				w_IC_p * L_IC_p_raw)
 				
-		total_loss = L_IC + w_R * weights["lambda_phys"] * L_phys_raw
+		total_loss = L_IC + w_R * L_phys_raw # 注意这里也不再乘 lambda_phys
 
 		# 记录各项损失值
 		self.loss_ic_hist.append(L_IC.item())

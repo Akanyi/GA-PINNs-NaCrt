@@ -39,7 +39,7 @@
         }
     },
     "training_process": {
-        "device": "cpu",
+        "device": "cuda",
         "DTYPE": "torch.float32",
         "import":{
             "analytical_solution_path": "Ground_Data/Problem_1/Analytical_Solution_Test_1.h5"
@@ -58,8 +58,8 @@
         },
         "parameters": {
             "optimizer": "Adam",
-            "learning_rate": 5e-4,
-            "lr_decay_gamma": 0.99,
+            "learning_rate": 5e-5,
+            "lr_decay_gamma": 0.995,
             "epochs": 600001,
             "random_seed": 123456,
             "gradient_clip_value": 1.0,
